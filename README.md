@@ -1,4 +1,4 @@
-# vertex_day_2
+# product_barcoding
 
 A new Flutter project.
 
