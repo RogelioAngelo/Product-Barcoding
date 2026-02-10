@@ -5,7 +5,6 @@ class CameraScannerPage extends StatefulWidget {
   final String productName;
   final String oldBarcode;
 
-  // Added constructor to receive product details
   const CameraScannerPage({
     super.key,
     required this.productName,
@@ -129,69 +128,98 @@ class _CameraScannerPageState extends State<CameraScannerPage> {
             ),
           ),
 
-          // Bottom manual entry affordance (always available)
+          // Bottom Actions (Manual Entry, Flash, Flip Camera)
           Positioned(
             bottom: 24,
             left: 24,
             right: 24,
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
               children: [
-                ElevatedButton.icon(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.white.withOpacity(0.9),
-                    foregroundColor: Colors.black,
-                  ),
-                  onPressed: () async {
-                    // open a dialog for manual input
-                    final manual = await showDialog<String?>(
-                      context: context,
-                      builder: (context) {
-                        final t = TextEditingController();
-                        return AlertDialog(
-                          title: const Text('Enter Barcode Manually'),
-                          content: TextField(
-                            controller: t,
-                            decoration: const InputDecoration(
-                              hintText: 'Barcode',
+                // 1. Manual Entry Button (Wide)
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.white.withOpacity(0.9),
+                      foregroundColor: Colors.black,
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                    ),
+                    onPressed: () async {
+                      final manual = await showDialog<String?>(
+                        context: context,
+                        builder: (context) {
+                          final t = TextEditingController();
+                          return AlertDialog(
+                            title: const Text('Enter Barcode Manually'),
+                            content: TextField(
+                              controller: t,
+                              decoration: const InputDecoration(
+                                hintText: 'Barcode',
+                              ),
                             ),
-                          ),
-                          actions: [
-                            TextButton(
-                              onPressed: () => Navigator.pop(context),
-                              child: const Text('Cancel'),
-                            ),
-                            ElevatedButton(
-                              onPressed: () =>
-                                  Navigator.pop(context, t.text.trim()),
-                              child: const Text('Save'),
-                            ),
-                          ],
-                        );
-                      },
-                    );
+                            actions: [
+                              TextButton(
+                                onPressed: () => Navigator.pop(context),
+                                child: const Text('Cancel'),
+                              ),
+                              ElevatedButton(
+                                onPressed: () =>
+                                    Navigator.pop(context, t.text.trim()),
+                                child: const Text('Save'),
+                              ),
+                            ],
+                          );
+                        },
+                      );
 
-                    if (manual != null && manual.isNotEmpty) {
-                      Navigator.pop(context, manual);
-                    }
-                  },
-                  icon: const Icon(Icons.edit),
-                  label: const Text('Enter Manually'),
+                      if (manual != null && manual.isNotEmpty) {
+                        Navigator.pop(context, manual);
+                      }
+                    },
+                    icon: const Icon(Icons.edit),
+                    label: const Text('Enter Manually'),
+                  ),
                 ),
-
-                ElevatedButton.icon(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.white.withOpacity(0.9),
-                    foregroundColor: Colors.black,
-                  ),
-                  onPressed: () async {
-                    // toggle flash as small helpful action
-                    try {
-                      await _controller.toggleTorch();
-                    } catch (_) {}
-                  },
-                  icon: const Icon(Icons.flash_on),
-                  label: const Text('Toggle Flash'),
+                const SizedBox(height: 10),
+                // 2. Camera Controls Row (Flash & Flip)
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    // Flash Button
+                    Expanded(
+                      child: ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.white.withOpacity(0.9),
+                          foregroundColor: Colors.black,
+                        ),
+                        onPressed: () async {
+                          try {
+                            await _controller.toggleTorch();
+                          } catch (_) {}
+                        },
+                        icon: const Icon(Icons.flash_on),
+                        label: const Text('Flash'),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    // Flip Camera Button [NEW]
+                    Expanded(
+                      child: ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.white.withOpacity(0.9),
+                          foregroundColor: Colors.black,
+                        ),
+                        onPressed: () async {
+                          try {
+                            await _controller.switchCamera();
+                          } catch (_) {}
+                        },
+                        icon: const Icon(Icons.flip_camera_ios),
+                        label: const Text('Flip'),
+                      ),
+                    ),
+                  ],
                 ),
               ],
             ),

@@ -2,17 +2,8 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
-// Ensure this import matches the filename where your ProductsScreen class is located
 import 'products.dart'; 
 
-void main() {
-  runApp(const MaterialApp(
-    home: LoginPage(),
-    debugShowCheckedModeBanner: false,
-  ));
-}
-
-// --- LOGIN PAGE ---
 class LoginPage extends StatefulWidget {
   const LoginPage({super.key});
 
@@ -26,15 +17,48 @@ class _LoginPageState extends State<LoginPage> {
   
   bool _isLoading = false;
   bool _obscurePassword = true;
+  bool _rememberMe = false; // Checkbox state
   String? _errorMessage;
 
+  @override
+  void initState() {
+    super.initState();
+    _checkRememberMe();
+  }
+
+  // --- 1. Startup Logic: Check for Saved Credentials ---
+  Future<void> _checkRememberMe() async {
+    final prefs = await SharedPreferences.getInstance();
+    final bool remember = prefs.getBool('remember_me') ?? false;
+    final String? cachedEmail = prefs.getString('cached_email');
+    final String? cachedPass = prefs.getString('cached_password');
+
+    if (remember && cachedEmail != null && cachedPass != null) {
+      setState(() {
+        _rememberMe = true;
+        _emailController.text = cachedEmail;
+        _passwordController.text = cachedPass;
+      });
+    }
+  }
+
+  // --- 2. Cache Helper ---
+  Future<void> _cacheUserCredentials(String email, String password) async {
+    final prefs = await SharedPreferences.getInstance();
+    // Cache credentials for both offline login AND Remember Me
+    await prefs.setString('cached_email', email);
+    await prefs.setString('cached_password', password);
+    // Save the user's preference
+    await prefs.setBool('remember_me', _rememberMe);
+  }
+
+  // --- 3. Login Logic ---
   Future<void> _handleLogin() async {
     final email = _emailController.text.trim();
     final password = _passwordController.text.trim();
 
     setState(() => _errorMessage = null);
 
-    // 1. Validation check
     if (email.isEmpty || password.isEmpty) {
       setState(() => _errorMessage = "Please fill in all fields.");
       return;
@@ -42,7 +66,7 @@ class _LoginPageState extends State<LoginPage> {
 
     final prefs = await SharedPreferences.getInstance();
     
-    // 2. Check email-specific lockout
+    // Check Lockout
     String? lockoutStr = prefs.getString('lockout_time_$email');
     if (lockoutStr != null) {
       final lockoutTime = DateTime.parse(lockoutStr);
@@ -60,13 +84,13 @@ class _LoginPageState extends State<LoginPage> {
     setState(() => _isLoading = true);
 
     try {
-      // Replace with your local IP or '10.0.2.2' for Android Emulator
-      final response = await http.get(Uri.parse('http://192.168.0.143:8056/items/user'));
+      // --- TRY ONLINE LOGIN ---
+      final response = await http.get(Uri.parse('http://192.168.0.143:8056/items/user'))
+          .timeout(const Duration(seconds: 5));
 
       if (response.statusCode == 200) {
         final List users = json.decode(response.body)['data'];
         
-        // 3. Match User in Database with Null-Safety Cast
         final user = users.cast<Map<String, dynamic>?>().firstWhere(
           (u) => u?['user_email'] == email,
           orElse: () => null,
@@ -75,37 +99,73 @@ class _LoginPageState extends State<LoginPage> {
         if (user == null) {
           setState(() => _errorMessage = "Account not found.");
         } else if (user['user_password'] == password) {
-          // Success! Clear failed attempts
-          await prefs.remove('failed_attempts_$email');
-          await prefs.remove('lockout_time_$email');
-          
-          if (!mounted) return;
-          
-          // 4. Redirect to ProductsScreen
-          Navigator.pushReplacement(
-            context, 
-            MaterialPageRoute(builder: (context) => const ProductsScreen())
-          );
+          await _loginSuccess(email, password); 
         } else {
-          // 5. Handle Failure and Lockout logic
-          int attempts = (prefs.getInt('failed_attempts_$email') ?? 0) + 1;
-          await prefs.setInt('failed_attempts_$email', attempts);
-
-          if (attempts >= 3) {
-            await prefs.setString('lockout_time_$email', DateTime.now().toIso8601String());
-            setState(() => _errorMessage = "3 failed attempts. Account Locked.");
-          } else {
-            setState(() => _errorMessage = "Invalid password. Attempt $attempts/3");
-          }
+          await _handleFailedAttempt(email, prefs);
         }
       } else {
         setState(() => _errorMessage = "Server error: ${response.statusCode}");
       }
     } catch (e) {
-      setState(() => _errorMessage = "Connection error. Is your API running?");
+      // --- OFFLINE FALLBACK ---
+      print("Network failed, checking offline cache: $e");
+      
+      final cachedEmail = prefs.getString('cached_email');
+      final cachedPass = prefs.getString('cached_password');
+
+      if (cachedEmail == email && cachedPass == password) {
+        _showOfflineSnackbar();
+        await _loginSuccess(email, password);
+      } else {
+        setState(() => _errorMessage = "Offline: Invalid credentials or no cached user.");
+      }
     } finally {
       if (mounted) setState(() => _isLoading = false);
     }
+  }
+
+  Future<void> _loginSuccess(String email, String password) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('failed_attempts_$email');
+    await prefs.remove('lockout_time_$email');
+    
+    // Save credentials logic
+    if (_rememberMe) {
+      await _cacheUserCredentials(email, password);
+    } else {
+      // If "Remember Me" is UNCHECKED, we still cache credentials for "Offline Login" capability,
+      // but we explicitly set 'remember_me' to false so fields won't auto-fill on restart.
+      await _cacheUserCredentials(email, password);
+      await prefs.setBool('remember_me', false); 
+    }
+
+    if (!mounted) return;
+    Navigator.pushReplacement(
+      context, 
+      MaterialPageRoute(builder: (context) => const ProductsScreen())
+    );
+  }
+
+  Future<void> _handleFailedAttempt(String email, SharedPreferences prefs) async {
+    int attempts = (prefs.getInt('failed_attempts_$email') ?? 0) + 1;
+    await prefs.setInt('failed_attempts_$email', attempts);
+
+    if (attempts >= 3) {
+      await prefs.setString('lockout_time_$email', DateTime.now().toIso8601String());
+      setState(() => _errorMessage = "3 failed attempts. Account Locked.");
+    } else {
+      setState(() => _errorMessage = "Invalid password. Attempt $attempts/3");
+    }
+  }
+
+  void _showOfflineSnackbar() {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text("Logged in securely (Offline Mode)"),
+        backgroundColor: Colors.orange,
+        duration: Duration(seconds: 2),
+      ),
+    );
   }
 
   @override
@@ -113,7 +173,7 @@ class _LoginPageState extends State<LoginPage> {
     return Scaffold(
       body: Stack(
         children: [
-          // Background Gradient
+          // Background
           Container(
             decoration: const BoxDecoration(
               gradient: LinearGradient(
@@ -123,7 +183,6 @@ class _LoginPageState extends State<LoginPage> {
               ),
             ),
           ),
-          // Decorative Background Circle
           Positioned(
             top: -100,
             right: -50,
@@ -151,7 +210,6 @@ class _LoginPageState extends State<LoginPage> {
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    // Brand/Icon Header - CHANGED TO BARCODE
                     Container(
                       padding: const EdgeInsets.all(16),
                       decoration: BoxDecoration(
@@ -162,7 +220,7 @@ class _LoginPageState extends State<LoginPage> {
                     ),
                     const SizedBox(height: 20),
                     Text(
-                      "Products Barcoding ",
+                      "Products Barcoding",
                       style: TextStyle(
                         fontSize: 26,
                         fontWeight: FontWeight.bold,
@@ -176,7 +234,6 @@ class _LoginPageState extends State<LoginPage> {
                     ),
                     const SizedBox(height: 30),
 
-                    // Error Message with Animation
                     if (_errorMessage != null)
                       AnimatedContainer(
                         duration: const Duration(milliseconds: 300),
@@ -202,7 +259,6 @@ class _LoginPageState extends State<LoginPage> {
                         ),
                       ),
 
-                    // Email Input
                     _buildTextField(
                       controller: _emailController,
                       label: "Email Address",
@@ -211,7 +267,6 @@ class _LoginPageState extends State<LoginPage> {
                     ),
                     const SizedBox(height: 20),
 
-                    // Password Input
                     _buildTextField(
                       controller: _passwordController,
                       label: "Password",
@@ -220,9 +275,24 @@ class _LoginPageState extends State<LoginPage> {
                       obscure: _obscurePassword,
                       onToggle: () => setState(() => _obscurePassword = !_obscurePassword),
                     ),
-                    const SizedBox(height: 35),
+                    
+                    // --- REMEMBER ME CHECKBOX ---
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Checkbox(
+                          value: _rememberMe,
+                          activeColor: Colors.blue.shade900,
+                          onChanged: (val) {
+                            setState(() => _rememberMe = val ?? false);
+                          },
+                        ),
+                        const Text("Remember Me"),
+                      ],
+                    ),
+                    
+                    const SizedBox(height: 20),
 
-                    // Login Button
                     SizedBox(
                       width: double.infinity,
                       height: 55,
@@ -248,7 +318,6 @@ class _LoginPageState extends State<LoginPage> {
                       ),
                     ),
                     const SizedBox(height: 15),
-                    
                   ],
                 ),
               ),
@@ -259,7 +328,6 @@ class _LoginPageState extends State<LoginPage> {
     );
   }
 
-  // Helper Widget for TextFields to keep the main build method clean
   Widget _buildTextField({
     required TextEditingController controller,
     required String label,
