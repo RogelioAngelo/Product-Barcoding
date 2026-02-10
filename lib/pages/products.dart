@@ -1,8 +1,8 @@
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
-import 'package:shared_preferences/shared_preferences.dart'; // Local storage package
-import 'package:intl/intl.dart'; // Standard package for date/time formatting
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:intl/intl.dart';
 import 'barcode.dart';
 
 class ProductsScreen extends StatefulWidget {
@@ -17,26 +17,30 @@ class _ProductsScreenState extends State<ProductsScreen> {
   List filteredProducts = [];
   List brands = [];
   List categories = [];
-  
+
   List<Map<String, dynamic>> recentScans = [];
 
   bool isLoading = true;
   String searchQuery = "";
   String? selectedBrandId;
   String? selectedCategoryId;
+  
+  // Pagination
+  static const int _pageSize = 30;
+  int _displayLimit = _pageSize;
+  bool _isLoadingMore = false;
 
-  // --- NEW SCROLL CONTROLLER & STATE ---
+  // Barcode Filter state
+  String? selectedBarcodeStatus;
+
   final ScrollController _scrollController = ScrollController();
   double _scrollProgress = 0.0;
-  bool _showBackToTop = false;
 
   @override
   void initState() {
     super.initState();
     _loadData();
-    _loadStoredHistory(); 
-
-    // Listen to scroll changes
+    _loadStoredHistory();
     _scrollController.addListener(_onScroll);
   }
 
@@ -47,32 +51,40 @@ class _ProductsScreenState extends State<ProductsScreen> {
     super.dispose();
   }
 
-  // --- SCROLL LOGIC ---
   void _onScroll() {
-    // 1. Calculate Progress (0.0 to 1.0)
     double progress = 0.0;
     if (_scrollController.hasClients && _scrollController.position.maxScrollExtent > 0) {
       progress = _scrollController.offset / _scrollController.position.maxScrollExtent;
     }
-
-    // 2. Decide if we show the button (e.g., after 300 pixels)
-    bool show = _scrollController.offset > 300;
-
     setState(() {
       _scrollProgress = progress.clamp(0.0, 1.0);
-      _showBackToTop = show;
     });
+
+    // Try to load more when user nears the bottom
+    _maybeLoadMore();
   }
 
-  void _scrollToTop() {
-    _scrollController.animateTo(
-      0,
-      duration: const Duration(milliseconds: 600),
-      curve: Curves.easeInOutCubic,
-    );
+  void _maybeLoadMore() {
+    if (!_scrollController.hasClients) return;
+    if (_isLoadingMore) return;
+    final max = _scrollController.position.maxScrollExtent;
+    final offset = _scrollController.offset;
+
+    // If within 200px of bottom and there are more items to show
+    if (offset >= (max - 200) && filteredProducts.length > _displayLimit) {
+      _isLoadingMore = true;
+      // small delay to show indicator smoothly
+      Future.delayed(const Duration(milliseconds: 200), () {
+        if (!mounted) return;
+        setState(() {
+          _displayLimit = (_displayLimit + _pageSize).clamp(0, filteredProducts.length);
+          _isLoadingMore = false;
+        });
+      });
+    }
   }
 
-  // --- PERSISTENCE LOGIC ---
+  // --- PERSISTENCE ---
 
   Future<void> _saveHistoryToDisk() async {
     final prefs = await SharedPreferences.getInstance();
@@ -83,14 +95,12 @@ class _ProductsScreenState extends State<ProductsScreen> {
       }
       return tempMap;
     }).toList());
-    
     await prefs.setString('barcode_history_key', encodedData);
   }
 
   Future<void> _loadStoredHistory() async {
     final prefs = await SharedPreferences.getInstance();
     final String? historyString = prefs.getString('barcode_history_key');
-    
     if (historyString != null) {
       final List decodedList = json.decode(historyString);
       setState(() {
@@ -98,7 +108,7 @@ class _ProductsScreenState extends State<ProductsScreen> {
           return {
             'product_name': item['product_name'],
             'barcode': item['barcode'],
-            'is_rescan': item['is_rescan'] ?? false, 
+            'is_rescan': item['is_rescan'] ?? false,
             'time': DateTime.tryParse(item['time'] ?? '') ?? DateTime.now(),
             'original_data': item['original_data'],
           };
@@ -113,7 +123,7 @@ class _ProductsScreenState extends State<ProductsScreen> {
     setState(() => recentScans.clear());
   }
 
-  // --- API DATA FETCHING ---
+  // --- API DATA ---
 
   Future<void> _loadData() async {
     setState(() => isLoading = true);
@@ -134,7 +144,6 @@ class _ProductsScreenState extends State<ProductsScreen> {
     final response = await http.get(Uri.parse('http://192.168.0.143:8056/items/products'));
     if (response.statusCode == 200) {
       List data = json.decode(response.body)['data'];
-      
       data.sort((a, b) {
         final bool hasA = a['barcode'] != null && a['barcode'].toString().trim().isNotEmpty;
         final bool hasB = b['barcode'] != null && b['barcode'].toString().trim().isNotEmpty;
@@ -144,7 +153,6 @@ class _ProductsScreenState extends State<ProductsScreen> {
         String nameB = (b['product_name'] ?? '').toString().toLowerCase();
         return nameA.compareTo(nameB);
       });
-
       allProducts = data;
       _applyFilters();
     }
@@ -169,17 +177,58 @@ class _ProductsScreenState extends State<ProductsScreen> {
       filteredProducts = allProducts.where((p) {
         final name = (p['product_name'] ?? "").toString().toLowerCase();
         final matchesSearch = name.contains(searchQuery.toLowerCase());
+        
         final String? pBrand = p['product_brand']?.toString();
         final bool matchesBrand = selectedBrandId == null || pBrand == selectedBrandId;
+        
         final String? pCategory = p['product_category']?.toString();
         final bool matchesCategory = selectedCategoryId == null || pCategory == selectedCategoryId;
-        return matchesSearch && matchesBrand && matchesCategory;
+
+        final bool hasBarcode = p['barcode'] != null && p['barcode'].toString().trim().isNotEmpty;
+        bool matchesStatus = true;
+        if (selectedBarcodeStatus == 'missing') {
+          matchesStatus = !hasBarcode;
+        } else if (selectedBarcodeStatus == 'has') {
+          matchesStatus = hasBarcode;
+        }
+
+        return matchesSearch && matchesBrand && matchesCategory && matchesStatus;
       }).toList();
+      // reset pagination when filters change
+      _displayLimit = _pageSize;
+      // ensure list scrolls to top when filters applied
+      if (_scrollController.hasClients) _scrollController.jumpTo(0);
     });
   }
 
+  // --- UNIQUE CHECK LOGIC ---
+
+  void _showDuplicateError(String barcode, String existingProductName) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text("Duplicate Barcode", style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold)),
+        content: Text("The barcode '$barcode' is already assigned to:\n\n$existingProductName"),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text("OK")),
+        ],
+      ),
+    );
+  }
+
   Future<void> updateProductBarcode(Map<String, dynamic> product, String newBarcode, {bool isRescan = false}) async {
-    final id = _getProductId(product);
+    final currentId = _getProductId(product);
+    final duplicateProduct = allProducts.firstWhere(
+      (p) => p['barcode']?.toString() == newBarcode && _getProductId(p) != currentId,
+      orElse: () => null,
+    );
+
+    if (duplicateProduct != null) {
+      _showDuplicateError(newBarcode, duplicateProduct['product_name'] ?? "Another product");
+      return;
+    }
+
+    final id = currentId;
     showDialog(
       context: context,
       barrierDismissible: false,
@@ -200,14 +249,14 @@ class _ProductsScreenState extends State<ProductsScreen> {
             'product_name': product['product_name'],
             'barcode': newBarcode,
             'time': DateTime.now(),
-            'is_rescan': isRescan, 
+            'is_rescan': isRescan,
             'original_data': product,
           });
         });
-        
+
         await _saveHistoryToDisk();
         _showSuccessDialog(product['product_name'] ?? 'Product', newBarcode);
-        _fetchProducts(); 
+        _fetchProducts();
       } else {
         _showSnackBar('❌ Update Failed');
       }
@@ -277,7 +326,7 @@ class _ProductsScreenState extends State<ProductsScreen> {
         backgroundColor: Colors.blue.shade900,
         foregroundColor: Colors.white,
         bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(130),
+          preferredSize: const Size.fromHeight(130), // Reduced height since filters are in one row
           child: _buildFilterSection(),
         ),
       ),
@@ -287,34 +336,6 @@ class _ProductsScreenState extends State<ProductsScreen> {
               onRefresh: _loadData,
               child: _buildProductList(),
             ),
-      // --- FLOATING ACTION BUTTON WITH PROGRESS BORDER ---
-      floatingActionButton: _showBackToTop 
-          ? Stack(
-              alignment: Alignment.center,
-              children: [
-                // The outer progress ring
-                SizedBox(
-                  width: 56,
-                  height: 56,
-                  child: CircularProgressIndicator(
-                    value: _scrollProgress,
-                    strokeWidth: 4,
-                    backgroundColor: Colors.blue.shade100,
-                    valueColor: AlwaysStoppedAnimation<Color>(Colors.blue.shade900),
-                  ),
-                ),
-                // The actual button
-                FloatingActionButton(
-                  onPressed: _scrollToTop,
-                  backgroundColor: Colors.blue.shade900,
-                  foregroundColor: Colors.white,
-                  mini: true,
-                  elevation: 0, // Zero elevation to keep it inside the ring cleanly
-                  child: const Icon(Icons.arrow_upward),
-                ),
-              ],
-            )
-          : null,
     );
   }
 
@@ -351,12 +372,10 @@ class _ProductsScreenState extends State<ProductsScreen> {
                     itemBuilder: (context, index) {
                       final item = recentScans[index];
                       final bool isRescan = item['is_rescan'] ?? false;
-
                       String formattedDateTime = "Unknown time";
                       if (item['time'] != null && item['time'] is DateTime) {
                         formattedDateTime = DateFormat('MMM d, h:mm a').format(item['time']);
                       }
-
                       return ListTile(
                         onTap: () async {
                           Navigator.pop(context);
@@ -370,7 +389,6 @@ class _ProductsScreenState extends State<ProductsScreen> {
                                 ),
                               ),
                             );
-
                             if (result != null && result.isNotEmpty) {
                               updateProductBarcode(item['original_data'], result, isRescan: true);
                             }
@@ -438,6 +456,7 @@ class _ProductsScreenState extends State<ProductsScreen> {
           const SizedBox(height: 10),
           Row(
             children: [
+              // 1. Brand Dropdown
               Expanded(
                 child: _buildDropdown(
                   hint: "Brand",
@@ -451,10 +470,11 @@ class _ProductsScreenState extends State<ProductsScreen> {
                   },
                 ),
               ),
-              const SizedBox(width: 8),
+              const SizedBox(width: 6),
+              // 2. Category Dropdown
               Expanded(
                 child: _buildDropdown(
-                  hint: "Category",
+                  hint: "Cat.",
                   value: selectedCategoryId,
                   items: categories,
                   idKey: 'category_id',
@@ -465,9 +485,43 @@ class _ProductsScreenState extends State<ProductsScreen> {
                   },
                 ),
               ),
+              const SizedBox(width: 6),
+              // 3. Barcode Status Dropdown
+              Expanded(
+                child: _buildBarcodeStatusDropdown(),
+              ),
             ],
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _buildBarcodeStatusDropdown() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.15), 
+        borderRadius: BorderRadius.circular(8)
+      ),
+      child: DropdownButtonHideUnderline(
+        child: DropdownButton<String>(
+          value: selectedBarcodeStatus,
+          hint: const Text("Status", style: TextStyle(color: Colors.white70, fontSize: 12)),
+          dropdownColor: Colors.blue.shade900,
+          iconEnabledColor: Colors.white,
+          isExpanded: true,
+          style: const TextStyle(color: Colors.white, fontSize: 12),
+          items: const [
+            DropdownMenuItem(value: null, child: Text("All")),
+            DropdownMenuItem(value: 'missing', child: Text("Missing Barcode")),
+            DropdownMenuItem(value: 'has', child: Text("Has Barcode")),
+          ],
+          onChanged: (val) {
+            setState(() => selectedBarcodeStatus = val);
+            _applyFilters();
+          },
+        ),
       ),
     );
   }
@@ -481,22 +535,22 @@ class _ProductsScreenState extends State<ProductsScreen> {
     required Function(String?) onChanged,
   }) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12),
+      padding: const EdgeInsets.symmetric(horizontal: 8),
       decoration: BoxDecoration(color: Colors.white.withOpacity(0.15), borderRadius: BorderRadius.circular(8)),
       child: DropdownButtonHideUnderline(
         child: DropdownButton<String>(
           value: value,
-          hint: Text(hint, style: const TextStyle(color: Colors.white70, fontSize: 13)),
+          hint: Text(hint, style: const TextStyle(color: Colors.white70, fontSize: 12)),
           dropdownColor: Colors.blue.shade900,
           iconEnabledColor: Colors.white,
           isExpanded: true,
-          style: const TextStyle(color: Colors.white, fontSize: 13),
+          style: const TextStyle(color: Colors.white, fontSize: 12),
           items: [
             DropdownMenuItem(value: null, child: Text("All $hint")),
             ...items.map((item) {
               return DropdownMenuItem(
                 value: item[idKey].toString(),
-                child: Text(item[nameKey].toString()),
+                child: Text(item[nameKey].toString(), overflow: TextOverflow.ellipsis),
               );
             }),
           ],
@@ -514,13 +568,14 @@ class _ProductsScreenState extends State<ProductsScreen> {
           children: [
             const Icon(Icons.search_off, size: 64, color: Colors.grey),
             const SizedBox(height: 16),
-            const Text("No products found matching filters."),
+            const Text("No products found."),
             TextButton(
               onPressed: () {
                 setState(() {
                   searchQuery = "";
                   selectedBrandId = null;
                   selectedCategoryId = null;
+                  selectedBarcodeStatus = null;
                 });
                 _applyFilters();
               },
@@ -530,14 +585,26 @@ class _ProductsScreenState extends State<ProductsScreen> {
         ),
       );
     }
+    final int visibleCount = filteredProducts.length < _displayLimit ? filteredProducts.length : _displayLimit;
+    final bool hasMore = filteredProducts.length > visibleCount;
+
     return ListView.builder(
-      controller: _scrollController, // ATTACH CONTROLLER HERE
+      controller: _scrollController,
       padding: const EdgeInsets.all(12),
-      itemCount: filteredProducts.length,
+      itemCount: visibleCount + (hasMore ? 1 : 0),
       itemBuilder: (context, index) {
+        if (index >= visibleCount) {
+          // Loading indicator at the end while more items are being prepared
+          return Padding(
+            padding: const EdgeInsets.symmetric(vertical: 12),
+            child: Center(
+              child: SizedBox(width: 24, height: 24, child: CircularProgressIndicator(strokeWidth: 2, valueColor: AlwaysStoppedAnimation<Color>(Colors.blue.shade900))),
+            ),
+          );
+        }
+
         final product = filteredProducts[index];
         final bool hasBarcode = product['barcode']?.toString().isNotEmpty ?? false;
-
         return Card(
           elevation: 0,
           margin: const EdgeInsets.only(bottom: 10),
@@ -561,7 +628,6 @@ class _ProductsScreenState extends State<ProductsScreen> {
                   ),
                 ),
               );
-
               if (result != null && result.isNotEmpty) {
                 updateProductBarcode(product, result, isRescan: false);
               }

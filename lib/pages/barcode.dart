@@ -45,10 +45,14 @@ class _CameraScannerPageState extends State<CameraScannerPage> {
 
                 final List<Barcode> barcodes = capture.barcodes;
                 if (barcodes.isNotEmpty) {
-                  final String code = barcodes.first.rawValue ?? "";
-                  if (code.isNotEmpty) {
-                    _hasScanned = true;
-                    Navigator.pop(context, code);
+                  for (final b in barcodes) {
+                    final raw = b.rawValue ?? '';
+                    // Ignore QR codes explicitly
+                    if (raw.isNotEmpty && b.format != BarcodeFormat.qrCode) {
+                      _hasScanned = true;
+                      Navigator.pop(context, raw);
+                      break;
+                    }
                   }
                 }
               },
