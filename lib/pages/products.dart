@@ -1,9 +1,13 @@
+import 'dart:async';
 import 'dart:convert';
+import 'package:drift/drift.dart' as drift; 
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:intl/intl.dart';
+import 'package:connectivity_plus/connectivity_plus.dart'; 
 import 'barcode.dart';
+import '../database/app_database.dart'; 
 
 class ProductsScreen extends StatefulWidget {
   const ProductsScreen({super.key});
@@ -13,25 +17,32 @@ class ProductsScreen extends StatefulWidget {
 }
 
 class _ProductsScreenState extends State<ProductsScreen> {
-  List allProducts = [];
-  List filteredProducts = [];
+  late AppDatabase _database;
+  
+  // Connectivity
+  late StreamSubscription<List<ConnectivityResult>> _connectivitySubscription;
+  bool _isOnline = true;
+
+  List<LocalProduct> allProducts = [];
+  List<LocalProduct> filteredProducts = [];
+  
   List brands = [];
   List categories = [];
-
   List<Map<String, dynamic>> recentScans = [];
 
   bool isLoading = true;
+  bool isSyncing = false; 
   String searchQuery = "";
   String? selectedBrandId;
   String? selectedCategoryId;
   
-  // Pagination
   static const int _pageSize = 30;
   int _displayLimit = _pageSize;
   bool _isLoadingMore = false;
 
-  // Barcode Filter state
-  String? selectedBarcodeStatus;
+  // --- KEY CHANGE HERE ---
+  // Default to 'missing' so scanned items disappear from the list automatically
+  String? selectedBarcodeStatus = 'missing';
 
   final ScrollController _scrollController = ScrollController();
   double _scrollProgress = 0.0;
@@ -39,13 +50,40 @@ class _ProductsScreenState extends State<ProductsScreen> {
   @override
   void initState() {
     super.initState();
+    _database = AppDatabase();
+    
+    _initConnectivity();
     _loadData();
     _loadStoredHistory();
     _scrollController.addListener(_onScroll);
   }
 
+  Future<void> _initConnectivity() async {
+    final result = await Connectivity().checkConnectivity();
+    _updateConnectionStatus(result);
+    _connectivitySubscription = Connectivity().onConnectivityChanged.listen(_updateConnectionStatus);
+  }
+
+  void _updateConnectionStatus(List<ConnectivityResult> results) {
+    bool isConnected = results.any((r) => 
+      r == ConnectivityResult.mobile || 
+      r == ConnectivityResult.wifi || 
+      r == ConnectivityResult.ethernet);
+
+    setState(() => _isOnline = isConnected);
+
+    if (isConnected) {
+      _processPendingSyncs();
+      if (allProducts.isEmpty || brands.isEmpty) {
+        _loadData(); 
+      }
+    }
+  }
+
   @override
   void dispose() {
+    _connectivitySubscription.cancel();
+    _database.close();
     _scrollController.removeListener(_onScroll);
     _scrollController.dispose();
     super.dispose();
@@ -59,8 +97,6 @@ class _ProductsScreenState extends State<ProductsScreen> {
     setState(() {
       _scrollProgress = progress.clamp(0.0, 1.0);
     });
-
-    // Try to load more when user nears the bottom
     _maybeLoadMore();
   }
 
@@ -70,10 +106,8 @@ class _ProductsScreenState extends State<ProductsScreen> {
     final max = _scrollController.position.maxScrollExtent;
     final offset = _scrollController.offset;
 
-    // If within 200px of bottom and there are more items to show
     if (offset >= (max - 200) && filteredProducts.length > _displayLimit) {
       _isLoadingMore = true;
-      // small delay to show indicator smoothly
       Future.delayed(const Duration(milliseconds: 200), () {
         if (!mounted) return;
         setState(() {
@@ -93,6 +127,7 @@ class _ProductsScreenState extends State<ProductsScreen> {
       if (tempMap['time'] is DateTime) {
         tempMap['time'] = (tempMap['time'] as DateTime).toIso8601String();
       }
+      tempMap.remove('original_data'); 
       return tempMap;
     }).toList());
     await prefs.setString('barcode_history_key', encodedData);
@@ -101,19 +136,25 @@ class _ProductsScreenState extends State<ProductsScreen> {
   Future<void> _loadStoredHistory() async {
     final prefs = await SharedPreferences.getInstance();
     final String? historyString = prefs.getString('barcode_history_key');
+    
     if (historyString != null) {
       final List decodedList = json.decode(historyString);
-      setState(() {
-        recentScans = decodedList.map((item) {
-          return {
-            'product_name': item['product_name'],
-            'barcode': item['barcode'],
-            'is_rescan': item['is_rescan'] ?? false,
-            'time': DateTime.tryParse(item['time'] ?? '') ?? DateTime.now(),
-            'original_data': item['original_data'],
-          };
-        }).toList();
-      });
+      final List<Map<String, dynamic>> loadedHistory = decodedList.map((item) {
+        return {
+          'product_name': item['product_name'],
+          'barcode': item['barcode'],
+          'is_rescan': item['is_rescan'] ?? false,
+          'synced': item['synced'] ?? true, 
+          'time': DateTime.tryParse(item['time'] ?? '') ?? DateTime.now(),
+          'original_data': null, 
+        };
+      }).toList().cast<Map<String, dynamic>>();
+
+      if (mounted) {
+        setState(() {
+          recentScans.addAll(loadedHistory);
+        });
+      }
     }
   }
 
@@ -123,42 +164,174 @@ class _ProductsScreenState extends State<ProductsScreen> {
     setState(() => recentScans.clear());
   }
 
-  // --- API DATA ---
+  // --- BACKGROUND SYNC ---
+
+  Future<void> _processPendingSyncs() async {
+    if (!_isOnline) return;
+
+    final pendingItems = await (_database.select(_database.localProducts)..where((t) => t.syncRequired.equals(true))).get();
+    
+    if (pendingItems.isEmpty) return;
+
+    setState(() => isSyncing = true);
+    bool historyWasUpdated = false;
+
+    for (final product in pendingItems) {
+      if (product.productId == null) continue;
+
+      try {
+        final response = await http.patch(
+          Uri.parse('http://192.168.0.143:8056/items/products/${product.productId}'),
+          headers: {'Content-Type': 'application/json'},
+          body: json.encode({'barcode': product.barcode}),
+        ).timeout(const Duration(seconds: 10));
+
+        if (response.statusCode == 200) {
+          await _database.update(_database.localProducts).replace(product.copyWith(syncRequired: false));
+          
+          for (var item in recentScans) {
+            if (item['barcode'] == product.barcode && item['synced'] == false) {
+              item['synced'] = true; 
+              historyWasUpdated = true;
+            }
+          }
+        }
+      } catch (e) {
+        print("Sync failed for ${product.productName}: $e");
+      }
+    }
+
+    if (historyWasUpdated && mounted) {
+      _saveHistoryToDisk();
+      _refreshLocalData(); 
+      _showSnackBar("✅ Offline data synced successfully!");
+    }
+    
+    if (mounted) setState(() => isSyncing = false);
+  }
+
+  // --- DATA LOADING ---
 
   Future<void> _loadData() async {
     setState(() => isLoading = true);
+    await _refreshLocalData();
+    
+    if (!_isOnline) {
+      if (mounted) {
+        setState(() => isLoading = false);
+        _showSnackBar("⚠️ You are Offline. Showing local data.");
+      }
+      return;
+    }
+
     try {
       await Future.wait([
-        _fetchProducts(),
         _fetchBrands(),
         _fetchCategories(),
-      ]);
+      ]).timeout(const Duration(seconds: 5));
+
+      if (mounted) {
+        setState(() => isLoading = false);
+        _syncProductsDownloader();
+      }
     } catch (e) {
-      _showSnackBar('Init Error: $e');
-    } finally {
-      if (mounted) setState(() => isLoading = false);
+      print("Error loading external data: $e");
+      if (mounted) {
+        setState(() => isLoading = false);
+        if (_isOnline) _showSnackBar("⚠️ Connection Error. Showing local data.");
+      }
     }
   }
 
-  Future<void> _fetchProducts() async {
-    final response = await http.get(Uri.parse('http://192.168.0.143:8056/items/products'));
-    if (response.statusCode == 200) {
-      List data = json.decode(response.body)['data'];
-      data.sort((a, b) {
-        final bool hasA = a['barcode'] != null && a['barcode'].toString().trim().isNotEmpty;
-        final bool hasB = b['barcode'] != null && b['barcode'].toString().trim().isNotEmpty;
-        if (!hasA && hasB) return -1;
-        if (hasA && !hasB) return 1;
-        String nameA = (a['product_name'] ?? '').toString().toLowerCase();
-        String nameB = (b['product_name'] ?? '').toString().toLowerCase();
-        return nameA.compareTo(nameB);
+  Future<void> _refreshLocalData() async {
+    final localData = await _database.getAllCachedProducts();
+    // Sort so items with NO barcode come first (Priority)
+    localData.sort((a, b) {
+      final bool hasA = a.barcode != null && a.barcode!.trim().isNotEmpty;
+      final bool hasB = b.barcode != null && b.barcode!.trim().isNotEmpty;
+      if (!hasA && hasB) return -1;
+      if (hasA && !hasB) return 1;
+      String nameA = (a.productName ?? '').toLowerCase();
+      String nameB = (b.productName ?? '').toLowerCase();
+      return nameA.compareTo(nameB);
+    });
+
+    if (mounted) {
+      setState(() {
+        allProducts = localData;
+        _applyFilters();
       });
-      allProducts = data;
-      _applyFilters();
+    }
+  }
+
+  Future<void> _syncProductsDownloader() async {
+    if (isSyncing) return;
+    setState(() => isSyncing = true);
+
+    try {
+      final response = await http.get(Uri.parse('http://192.168.0.143:8056/items/products'))
+         .timeout(const Duration(seconds: 10));
+      
+      if (response.statusCode == 200) {
+        List apiData = json.decode(response.body)['data'];
+        
+        final existingProducts = await _database.getAllCachedProducts();
+        final Map<String, LocalProduct> existingMap = {
+          for (var p in existingProducts) 
+            if (p.productId != null) p.productId!: p
+        };
+
+        await _database.batch((batch) {
+          for (var item in apiData) {
+            final String? pId = item['product_id']?.toString();
+            final String? barcode = item['barcode']?.toString();
+            final String? name = item['product_name'];
+            final String? brand = item['product_brand']?.toString();
+            final String? category = item['product_category']?.toString();
+
+            if (pId != null) {
+              final existing = existingMap[pId];
+              if (existing != null) {
+                if (!existing.syncRequired) {
+                  batch.update(
+                    _database.localProducts,
+                    LocalProductsCompanion(
+                      id: drift.Value(existing.id),
+                      productName: drift.Value(name),
+                      barcode: drift.Value(barcode),
+                      productBrand: drift.Value(brand),
+                      productCategory: drift.Value(category),
+                    ),
+                  );
+                }
+              } else {
+                batch.insert(
+                  _database.localProducts,
+                  LocalProductsCompanion.insert(
+                    productId: drift.Value(pId),
+                    productName: drift.Value(name),
+                    barcode: drift.Value(barcode),
+                    productBrand: drift.Value(brand),
+                    productCategory: drift.Value(category),
+                    syncRequired: drift.Value(false),
+                  ),
+                );
+              }
+            }
+          }
+        });
+
+        await _refreshLocalData();
+      }
+    } catch (e) {
+      print("Downloader Sync Error: $e");
+    } finally {
+      if (mounted) setState(() => isSyncing = false);
     }
   }
 
   Future<void> _fetchBrands() async {
+    if (!_isOnline) return;
     final res = await http.get(Uri.parse('http://192.168.0.143:8056/items/brand'));
     if (res.statusCode == 200) {
       setState(() => brands = json.decode(res.body)['data']);
@@ -166,6 +339,7 @@ class _ProductsScreenState extends State<ProductsScreen> {
   }
 
   Future<void> _fetchCategories() async {
+    if (!_isOnline) return;
     final res = await http.get(Uri.parse('http://192.168.0.143:8056/items/categories'));
     if (res.statusCode == 200) {
       setState(() => categories = json.decode(res.body)['data']);
@@ -175,17 +349,19 @@ class _ProductsScreenState extends State<ProductsScreen> {
   void _applyFilters() {
     setState(() {
       filteredProducts = allProducts.where((p) {
-        final name = (p['product_name'] ?? "").toString().toLowerCase();
+        final name = (p.productName ?? "").toLowerCase();
         final matchesSearch = name.contains(searchQuery.toLowerCase());
         
-        final String? pBrand = p['product_brand']?.toString();
+        final String? pBrand = p.productBrand;
         final bool matchesBrand = selectedBrandId == null || pBrand == selectedBrandId;
         
-        final String? pCategory = p['product_category']?.toString();
+        final String? pCategory = p.productCategory;
         final bool matchesCategory = selectedCategoryId == null || pCategory == selectedCategoryId;
 
-        final bool hasBarcode = p['barcode'] != null && p['barcode'].toString().trim().isNotEmpty;
+        final bool hasBarcode = p.barcode != null && p.barcode!.trim().isNotEmpty;
         bool matchesStatus = true;
+        
+        // This logic ensures scanned items disappear if 'missing' is selected
         if (selectedBarcodeStatus == 'missing') {
           matchesStatus = !hasBarcode;
         } else if (selectedBarcodeStatus == 'has') {
@@ -194,14 +370,13 @@ class _ProductsScreenState extends State<ProductsScreen> {
 
         return matchesSearch && matchesBrand && matchesCategory && matchesStatus;
       }).toList();
-      // reset pagination when filters change
+      
       _displayLimit = _pageSize;
-      // ensure list scrolls to top when filters applied
       if (_scrollController.hasClients) _scrollController.jumpTo(0);
     });
   }
 
-  // --- UNIQUE CHECK LOGIC ---
+  // --- UPDATE LOGIC ---
 
   void _showDuplicateError(String barcode, String existingProductName) {
     showDialog(
@@ -216,53 +391,51 @@ class _ProductsScreenState extends State<ProductsScreen> {
     );
   }
 
-  Future<void> updateProductBarcode(Map<String, dynamic> product, String newBarcode, {bool isRescan = false}) async {
-    final currentId = _getProductId(product);
-    final duplicateProduct = allProducts.firstWhere(
-      (p) => p['barcode']?.toString() == newBarcode && _getProductId(p) != currentId,
-      orElse: () => null,
+  Future<void> updateProductBarcode(LocalProduct product, String newBarcode, {bool isRescan = false}) async {
+    final duplicate = allProducts.firstWhere(
+      (p) => p.barcode == newBarcode && p.id != product.id,
+      orElse: () => const LocalProduct(id: -1, syncRequired: false),
     );
 
-    if (duplicateProduct != null) {
-      _showDuplicateError(newBarcode, duplicateProduct['product_name'] ?? "Another product");
+    if (duplicate.id != -1) {
+      _showDuplicateError(newBarcode, duplicate.productName ?? "Another product");
       return;
     }
 
-    final id = currentId;
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => const Center(child: CircularProgressIndicator()),
+    final updatedProduct = product.copyWith(
+      barcode: drift.Value(newBarcode),
+      syncRequired: true, 
     );
 
-    try {
-      final response = await http.patch(
-        Uri.parse('http://192.168.0.143:8056/items/products/$id'),
-        headers: {'Content-Type': 'application/json'},
-        body: json.encode({'barcode': newBarcode}),
-      );
+    await _database.update(_database.localProducts).replace(updatedProduct);
 
-      Navigator.pop(context);
-      if (response.statusCode == 200) {
-        setState(() {
-          recentScans.insert(0, {
-            'product_name': product['product_name'],
-            'barcode': newBarcode,
-            'time': DateTime.now(),
-            'is_rescan': isRescan,
-            'original_data': product,
-          });
-        });
-
-        await _saveHistoryToDisk();
-        _showSuccessDialog(product['product_name'] ?? 'Product', newBarcode);
-        _fetchProducts();
-      } else {
-        _showSnackBar('❌ Update Failed');
+    setState(() {
+      // 1. Update the main list
+      final index = allProducts.indexWhere((p) => p.id == product.id);
+      if (index != -1) {
+        allProducts[index] = updatedProduct;
       }
-    } catch (e) {
-      Navigator.pop(context);
-      _showSnackBar('Error: $e');
+      
+      // 2. Refresh Filters 
+      // (This will cause the item to DISAPPEAR from view because it now has a barcode)
+      _applyFilters();
+      
+      // 3. Add to History
+      recentScans.insert(0, {
+        'product_name': product.productName,
+        'barcode': newBarcode,
+        'time': DateTime.now(),
+        'is_rescan': isRescan,
+        'synced': false,
+        'original_data': updatedProduct, 
+      });
+    });
+    
+    _saveHistoryToDisk();
+    _showSuccessDialog(product.productName ?? 'Product', newBarcode);
+
+    if (_isOnline) {
+      _processPendingSyncs();
     }
   }
 
@@ -279,6 +452,12 @@ class _ProductsScreenState extends State<ProductsScreen> {
               const SizedBox(height: 16),
               const Text("Update Successful!", style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
               const SizedBox(height: 8),
+              Text(
+                _isOnline ? "Saved and Syncing..." : "Saved locally (Offline)", 
+                textAlign: TextAlign.center, 
+                style: const TextStyle(fontSize: 12, color: Colors.grey)
+              ),
+              const SizedBox(height: 12),
               Text("The barcode for $name has been updated to:", textAlign: TextAlign.center),
               const SizedBox(height: 12),
               Container(
@@ -302,14 +481,6 @@ class _ProductsScreenState extends State<ProductsScreen> {
     );
   }
 
-  dynamic _getProductId(Map<String, dynamic> product) {
-    const idFieldNames = ['product_id', 'id', 'itemId', 'item_id', 'productId'];
-    for (var key in idFieldNames) {
-      if (product[key] != null) return product[key];
-    }
-    return null;
-  }
-
   void _showSnackBar(String message) {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text(message), behavior: SnackBarBehavior.floating),
@@ -322,18 +493,33 @@ class _ProductsScreenState extends State<ProductsScreen> {
       backgroundColor: const Color(0xFFF4F7F9),
       endDrawer: _buildHistoryDrawer(),
       appBar: AppBar(
-        title: const Text('Products Barcoding ', style: TextStyle(fontWeight: FontWeight.bold)),
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Products Barcoding', style: TextStyle(fontWeight: FontWeight.bold)),
+            if (isSyncing)
+              const Text('Syncing data...', style: TextStyle(fontSize: 12, fontWeight: FontWeight.normal)),
+            if (!_isOnline)
+              const Text('Offline Mode', style: TextStyle(fontSize: 12, color: Colors.orangeAccent, fontWeight: FontWeight.bold)),
+          ],
+        ),
         backgroundColor: Colors.blue.shade900,
         foregroundColor: Colors.white,
         bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(130), // Reduced height since filters are in one row
+          preferredSize: const Size.fromHeight(130),
           child: _buildFilterSection(),
         ),
       ),
-      body: isLoading
+      body: isLoading && allProducts.isEmpty
           ? const Center(child: CircularProgressIndicator())
           : RefreshIndicator(
-              onRefresh: _loadData,
+              onRefresh: () async {
+                if (_isOnline) {
+                  await _loadData();
+                } else {
+                  _showSnackBar("Cannot refresh while offline");
+                }
+              },
               child: _buildProductList(),
             ),
     );
@@ -372,14 +558,19 @@ class _ProductsScreenState extends State<ProductsScreen> {
                     itemBuilder: (context, index) {
                       final item = recentScans[index];
                       final bool isRescan = item['is_rescan'] ?? false;
+                      final bool isSynced = item['synced'] ?? true; 
+
                       String formattedDateTime = "Unknown time";
                       if (item['time'] != null && item['time'] is DateTime) {
                         formattedDateTime = DateFormat('MMM d, h:mm a').format(item['time']);
                       }
+                      
+                      LocalProduct? originalObj = item['original_data'] as LocalProduct?;
+
                       return ListTile(
                         onTap: () async {
                           Navigator.pop(context);
-                          if (item['original_data'] != null) {
+                          if (originalObj != null) {
                             final String? result = await Navigator.push(
                               context,
                               MaterialPageRoute(
@@ -390,8 +581,10 @@ class _ProductsScreenState extends State<ProductsScreen> {
                               ),
                             );
                             if (result != null && result.isNotEmpty) {
-                              updateProductBarcode(item['original_data'], result, isRescan: true);
+                              updateProductBarcode(originalObj, result, isRescan: true);
                             }
+                          } else {
+                            _showSnackBar("Cannot re-edit from history (Product data lost)");
                           }
                         },
                         title: Row(
@@ -400,6 +593,7 @@ class _ProductsScreenState extends State<ProductsScreen> {
                             if (isRescan)
                               Container(
                                 padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                margin: const EdgeInsets.only(left: 4),
                                 decoration: BoxDecoration(color: Colors.orange.shade100, borderRadius: BorderRadius.circular(4)),
                                 child: const Text("RE-SCANNED", style: TextStyle(fontSize: 9, color: Colors.orange, fontWeight: FontWeight.bold)),
                               ),
@@ -410,20 +604,23 @@ class _ProductsScreenState extends State<ProductsScreen> {
                           children: [
                             Text('Barcode: ${item['barcode']}'),
                             const SizedBox(height: 4),
-                            Row(
-                              children: [
-                                const Icon(Icons.access_time, size: 14, color: Colors.grey),
-                                const SizedBox(width: 4),
-                                Text(
-                                  formattedDateTime,
-                                  style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
-                                ),
-                              ],
-                            ),
+                            Text(formattedDateTime, style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
                           ],
                         ),
-                        trailing: Icon(Icons.qr_code_scanner, size: 20, color: isRescan ? Colors.orange : Colors.blue),
-                        leading: Icon(isRescan ? Icons.published_with_changes : Icons.check_circle, color: isRescan ? Colors.orange : Colors.green),
+                        trailing: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Icon(
+                              isSynced ? Icons.cloud_done : Icons.cloud_off, 
+                              size: 20, 
+                              color: isSynced ? Colors.green : Colors.orange
+                            ),
+                            Text(
+                              isSynced ? "Saved" : "Pending", 
+                              style: TextStyle(fontSize: 8, color: isSynced ? Colors.green : Colors.orange)
+                            )
+                          ],
+                        ),
                       );
                     },
                   ),
@@ -456,7 +653,6 @@ class _ProductsScreenState extends State<ProductsScreen> {
           const SizedBox(height: 10),
           Row(
             children: [
-              // 1. Brand Dropdown
               Expanded(
                 child: _buildDropdown(
                   hint: "Brand",
@@ -471,7 +667,6 @@ class _ProductsScreenState extends State<ProductsScreen> {
                 ),
               ),
               const SizedBox(width: 6),
-              // 2. Category Dropdown
               Expanded(
                 child: _buildDropdown(
                   hint: "Cat.",
@@ -486,7 +681,6 @@ class _ProductsScreenState extends State<ProductsScreen> {
                 ),
               ),
               const SizedBox(width: 6),
-              // 3. Barcode Status Dropdown
               Expanded(
                 child: _buildBarcodeStatusDropdown(),
               ),
@@ -575,7 +769,7 @@ class _ProductsScreenState extends State<ProductsScreen> {
                   searchQuery = "";
                   selectedBrandId = null;
                   selectedCategoryId = null;
-                  selectedBarcodeStatus = null;
+                  selectedBarcodeStatus = null; // Reset to 'All' if they click this
                 });
                 _applyFilters();
               },
@@ -594,7 +788,6 @@ class _ProductsScreenState extends State<ProductsScreen> {
       itemCount: visibleCount + (hasMore ? 1 : 0),
       itemBuilder: (context, index) {
         if (index >= visibleCount) {
-          // Loading indicator at the end while more items are being prepared
           return Padding(
             padding: const EdgeInsets.symmetric(vertical: 12),
             child: Center(
@@ -604,7 +797,9 @@ class _ProductsScreenState extends State<ProductsScreen> {
         }
 
         final product = filteredProducts[index];
-        final bool hasBarcode = product['barcode']?.toString().isNotEmpty ?? false;
+        final bool hasBarcode = product.barcode != null && product.barcode!.trim().isNotEmpty;
+        final bool isSyncPending = product.syncRequired;
+
         return Card(
           elevation: 0,
           margin: const EdgeInsets.only(bottom: 10),
@@ -615,16 +810,30 @@ class _ProductsScreenState extends State<ProductsScreen> {
               backgroundColor: hasBarcode ? Colors.green.shade50 : Colors.red.shade50,
               child: Icon(hasBarcode ? Icons.inventory_2_rounded : Icons.priority_high_rounded, color: hasBarcode ? Colors.green : Colors.red),
             ),
-            title: Text(product['product_name'] ?? 'Unnamed Product', style: const TextStyle(fontWeight: FontWeight.bold)),
-            subtitle: Text(hasBarcode ? 'Barcode: ${product['barcode']}' : '⚠️ Missing Barcode', style: TextStyle(color: hasBarcode ? Colors.grey.shade600 : Colors.red.shade700, fontWeight: hasBarcode ? FontWeight.normal : FontWeight.bold)),
+            title: Text(product.productName ?? 'Unnamed Product', style: const TextStyle(fontWeight: FontWeight.bold)),
+            subtitle: Row(
+              children: [
+                Expanded(
+                  child: Text(hasBarcode ? 'Barcode: ${product.barcode}' : '⚠️ Missing Barcode', style: TextStyle(color: hasBarcode ? Colors.grey.shade600 : Colors.red.shade700, fontWeight: hasBarcode ? FontWeight.normal : FontWeight.bold)),
+                ),
+                if (isSyncPending)
+                  const Row(
+                    children: [
+                      Icon(Icons.cloud_upload, size: 14, color: Colors.orange),
+                      SizedBox(width: 4),
+                      Text("Unsaved", style: TextStyle(fontSize: 10, color: Colors.orange)),
+                    ],
+                  )
+              ],
+            ),
             trailing: Icon(Icons.qr_code_scanner, color: Colors.blue.shade800),
             onTap: () async {
               final String? result = await Navigator.push(
                 context,
                 MaterialPageRoute(
                   builder: (_) => CameraScannerPage(
-                    productName: product['product_name'] ?? 'Unnamed',
-                    oldBarcode: product['barcode'] ?? 'NONE',
+                    productName: product.productName ?? 'Unnamed',
+                    oldBarcode: product.barcode ?? 'NONE',
                   ),
                 ),
               );
